@@ -100,3 +100,59 @@ func TestFundingQuotaAndReportUniqueness(t *testing.T) {
 		t.Fatal("duplicate annual report should fail")
 	}
 }
+
+// CancelAwareMilestone must honor the expected-state invariant: a cancelled
+// context (network timeout) cannot leave a milestone behind, and a frontend
+// retry against the now-stale version must fail with ErrConflict instead of
+// creating a duplicate node.
+func TestCancelAwareMilestoneTimeoutLeavesNoNodeAndRetriesConflict(t *testing.T) {
+	s := NewService(testDB(t))
+	p, err := s.Create(context.Background(), 1, "掉线窗口平台", "忻州", "材料", time.Now().Year()+1, 100, "cancel-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Submit(context.Background(), 1, p.ID, p.Version); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.StartReview(context.Background(), 2, p.ID, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Decide(context.Background(), 2, p.ID, 3, true, "ok"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Activate(context.Background(), 1, p.ID, 4); err != nil {
+		t.Fatal(err)
+	}
+	active := int64(5)
+
+	// Simulate a client disconnect mid-request: the context is cancelled before
+	// the call, so the transaction must roll back and leave no milestone behind.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := s.CancelAwareMilestone(ctx, 1, p.ID, active); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM platform_milestones WHERE platform_id=?`, p.ID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("cancelled timeout left %d milestone(s) behind", n)
+	}
+
+	// A frontend retry against the still-current version now succeeds exactly once.
+	if err := s.CancelAwareMilestone(context.Background(), 1, p.ID, active); err != nil {
+		t.Fatalf("first commit failed: %v", err)
+	}
+	// The committed version advanced, so replaying the same version conflicts
+	// instead of creating a duplicate node.
+	if err := s.CancelAwareMilestone(context.Background(), 1, p.ID, active); !errors.Is(err, apperrors.ErrConflict) {
+		t.Fatalf("expected conflict on stale-version retry, got %v", err)
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM platform_milestones WHERE platform_id=?`, p.ID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("expected single committed node, got %d", n)
+	}
+}
