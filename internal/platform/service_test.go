@@ -100,3 +100,34 @@ func TestFundingQuotaAndReportUniqueness(t *testing.T) {
 		t.Fatal("duplicate annual report should fail")
 	}
 }
+
+// FundWithAudit's audit step references an actor that does not exist, so the
+// approval fails. The funding detail must roll back together with the audit so
+// the budget balance is not consumed by a failed approval batch.
+func TestFundWithAuditRollsBackBudgetOnApprovalError(t *testing.T) {
+	db := testDB(t)
+	s := NewService(db)
+	p, err := s.Create(context.Background(), 1, "平台-审批", "忻州", "材料", time.Now().Year()+1, 100, "audit-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Submit(context.Background(), 1, p.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.StartReview(context.Background(), 2, p.ID, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Decide(context.Background(), 2, p.ID, 3, true, "ok"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FundWithAudit(context.Background(), 1, p.ID, p.Version); err == nil {
+		t.Fatal("expected FundWithAudit approval to fail on the audit step")
+	}
+	var used int64
+	if err := db.QueryRow(`SELECT COALESCE(SUM(amount_cents),0) FROM platform_funding WHERE platform_id=? AND status='approved'`, p.ID).Scan(&used); err != nil {
+		t.Fatal(err)
+	}
+	if used != 0 {
+		t.Fatalf("budget consumed by failed approval: used=%d", used)
+	}
+}
