@@ -2,6 +2,7 @@ package platform
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"testing"
 	"time"
@@ -98,5 +99,129 @@ func TestFundingQuotaAndReportUniqueness(t *testing.T) {
 	}
 	if err := s.SubmitReport(context.Background(), 1, p.ID, 2026, "b"); err == nil {
 		t.Fatal("duplicate annual report should fail")
+	}
+}
+
+// approvedFundingCents sums the platform_funding rows that still count toward
+// the used budget, mirroring RecordFunding's quota computation.
+func approvedFundingCents(t *testing.T, db *storage.DB, platformID int64) int64 {
+	t.Helper()
+	var used int64
+	if err := db.QueryRow(`SELECT COALESCE(SUM(amount_cents),0) FROM platform_funding WHERE platform_id=? AND status='approved'`, platformID).Scan(&used); err != nil {
+		t.Fatal(err)
+	}
+	return used
+}
+
+// auditCancelFundingResult returns the result of the audit event recorded for a
+// cancel_funding action on the platform, if any.
+func auditCancelFundingResult(t *testing.T, db *storage.DB, platformID int64) (string, bool) {
+	t.Helper()
+	var result string
+	err := db.QueryRow(`SELECT result FROM audit_events WHERE object_id=? AND action='cancel_funding' ORDER BY id DESC LIMIT 1`, platformID).Scan(&result)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result, true
+}
+
+func TestCancelFundingRevokesRealVoucherAtomically(t *testing.T) {
+	db := testDB(t)
+	s := NewService(db)
+	p, err := s.Create(context.Background(), 1, "撤销-平台", "忻州", "材料", time.Now().Year()+1, 1000, "rev-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Submit(context.Background(), 1, p.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.StartReview(context.Background(), 2, p.ID, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Decide(context.Background(), 2, p.ID, 3, true, "ok"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordFunding(context.Background(), 1, p.ID, 600, 1, "rev-fund-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Activate(context.Background(), 1, p.ID, 4); err != nil {
+		t.Fatal(err)
+	}
+
+	// Revoke on the correct version succeeds and reflects the real voucher:
+	// the approved funding flips to cancelled, reclaiming the budget rather
+	// than deducting without a voucher.
+	if err := s.CancelFundingWithAudit(context.Background(), 1, p.ID, 5); err != nil {
+		t.Fatalf("expected cancel to succeed, got %v", err)
+	}
+	if used := approvedFundingCents(t, db, p.ID); used != 0 {
+		t.Fatalf("approved funding should be reclaimed, got used=%d", used)
+	}
+	if res, ok := auditCancelFundingResult(t, db, p.ID); !ok || res != "ok" {
+		t.Fatalf("expected ok cancel_funding audit event, got %q ok=%v", res, ok)
+	}
+
+	// After reclaim, the full budget is available again.
+	if err := s.RecordFunding(context.Background(), 1, p.ID, 1000, 2, "rev-fund-2"); err != nil {
+		t.Fatalf("expected budget reclaimed after cancel, got %v", err)
+	}
+}
+
+func TestCancelFundingRequiresRealVoucherAndIsAtomic(t *testing.T) {
+	db := testDB(t)
+	s := NewService(db)
+	p, err := s.Create(context.Background(), 1, "撤销-无凭证", "忻州", "材料", time.Now().Year()+1, 1000, "rev-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Submit(context.Background(), 1, p.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.StartReview(context.Background(), 2, p.ID, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Decide(context.Background(), 2, p.ID, 3, true, "ok"); err != nil {
+		t.Fatal(err)
+	}
+
+	// No approved funding exists yet: cancelling must refuse rather than
+	// fabricate a voucher-less deduction, and must change nothing.
+	beforeUsed := approvedFundingCents(t, db, p.ID)
+	if !errors.Is(s.CancelFundingWithAudit(context.Background(), 1, p.ID, 4), apperrors.ErrInvalidState) {
+		t.Fatal("expected invalid state when no real voucher exists")
+	}
+	if used := approvedFundingCents(t, db, p.ID); used != beforeUsed {
+		t.Fatalf("approved funding must not change on refused cancel, before=%d after=%d", beforeUsed, used)
+	}
+}
+
+func TestCancelFundingRejectsStaleVersion(t *testing.T) {
+	db := testDB(t)
+	s := NewService(db)
+	p, err := s.Create(context.Background(), 1, "撤销-版本", "忻州", "材料", time.Now().Year()+1, 1000, "rev-3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Submit(context.Background(), 1, p.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.StartReview(context.Background(), 2, p.ID, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Decide(context.Background(), 2, p.ID, 3, true, "ok"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordFunding(context.Background(), 1, p.ID, 600, 1, "rev-fund-3"); err != nil {
+		t.Fatal(err)
+	}
+	// Stale version: must return conflict and leave funding approved.
+	if !errors.Is(s.CancelFundingWithAudit(context.Background(), 1, p.ID, 3), apperrors.ErrConflict) {
+		t.Fatal("expected conflict on stale version")
+	}
+	if used := approvedFundingCents(t, db, p.ID); used != 600 {
+		t.Fatalf("funding must remain approved on stale-version cancel, got used=%d", used)
 	}
 }
